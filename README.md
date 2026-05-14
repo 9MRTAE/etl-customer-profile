@@ -1,6 +1,6 @@
-# etl-pms-customer
+# etl-customer-profile
 
-ETL pipeline — **GCS Data Lake → BigQuery DWH · PMS Customer domain**
+ETL pipeline — **GCS Data Lake → BigQuery DWH · Customer Profile domain**
 
 Reads Parquet from GCS Data Lake (output of ingest repos), transforms, and upserts into BigQuery
 Covers Customer, Party, User, Company, Project, and Unit for the PMS (Property Management System)
