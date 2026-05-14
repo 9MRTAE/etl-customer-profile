@@ -1,11 +1,11 @@
 # etl-customer-profile
 
-ETL pipeline — **GCS Data Lake → BigQuery DWH · Customer Profile domain**
+ETL pipeline — **GCS Data Lake → BigQuery DWH · PMS Customer domain**
 
-Reads Parquet from GCS Data Lake (output of ingest repos), transforms, and upserts into BigQuery
-Covers Customer, Party, User, Company, Project, and Unit for the PMS (Property Management System)
+Reads Parquet from GCS Data Lake (output of ingest repos), transforms, and upserts into BigQuery.
+Covers Customer, Party, User, Company, Project, and Unit for the PMS (Property Management System).
 
-**Stack:** Python · pandas · BigQuery Client · gcsfs · GCP Secret Manager · Prefect v3 · Docker · Jenkins
+**Stack:** Python · pandas · BigQuery Client · pandas-gbq · gcsfs · GCP Secret Manager · Prefect v3 · Docker · Jenkins
 
 ---
 
@@ -16,7 +16,7 @@ Covers Customer, Party, User, Company, Project, and Unit for the PMS (Property M
 | **Source** | GCS Data Lake — Parquet from 8+ ingest repos (`pmsmanagement`, `gcp-ingest-mssql`, `authentication`, `pdpa`, `homeservice`, `notification`, `mobileregister`, `loyalty`) |
 | **Sink** | BigQuery schema `los` — 33 flows → dim/fact tables |
 | **Pattern** | Factory + Registry — `FlowConfig` dataclass is the single source of truth; `make_flow()` generates Prefect flows from config |
-| **Load mode** | Upsert by PK (default) or append — configured per table in `FlowConfig` |
+| **Load mode** | Upsert by PK (temp-table pattern) or append — configured per table in `FlowConfig` |
 | **Auth** | GCP Secret Manager (ADC on worker) — no credentials hardcoded in the repo |
 
 ---
@@ -28,12 +28,12 @@ GCS Data Lake
   gs://{bucket}/gcp-storage-parquet/{application}/{source_type}/{table}/
       calendar_year=YYYY/month_no=M/day_of_month=D/
   │
-  │  gcsfs + pandas · read_parquet()
+  │  gcsfs + pyarrow · read_table()
   ▼
-[Extract Task]
-  extract_lake()      — reads Parquet for the specified date (incremental)
-  extract_lake_join() — reads all partitions + deduplicates to latest row (lookup tables)
-  extract_dwh()       — queries BigQuery directly (pulls existing data for use in transform)
+[Extract Task]  — 3 modes (see Extract Modes below)
+  extract_lake()      — incremental: reads a single date partition
+  extract_lake_join() — full dedup: reads all partitions → latest row per key
+  extract_dwh()       — queries BigQuery directly (cross-flow reference data)
   │
   ▼
 [Transform Task]
@@ -41,14 +41,15 @@ GCS Data Lake
   output: pd.DataFrame ready for upsert
   │
   ▼
-[Load Task]
-  load() — upsert into BigQuery (MERGE by PK) or append
+[Load Task]  — temp-table upsert (see Load Pattern below)
+  upsert: write temp → DELETE matching PKs from target → INSERT SELECT with CAST → TRUNCATE temp
+  append: pandas_gbq.to_gbq(..., if_exists="append")
   target: your-gcp-project-id.los.{dwh_table}
 ```
 
 **Credentials flow:**
 - Worker Node uses **ADC (Workload Identity)** to call GCP Secret Manager
-- Secret Manager returns SA key JSON → separate credentials are constructed for GCS (Storage) and BigQuery
+- Secret Manager returns SA key JSON → separate credentials for GCS (Storage) and BigQuery
 - `PREFECT_DEPLOY_MODE=1` → skips Secret Manager during the deploy step
 
 ---
@@ -80,13 +81,13 @@ FlowConfig(
 # loop: extract sources → transform → load → upsert BQ
 ```
 
-Adding a new table = adding a `FlowConfig` entry to the registry → the factory generates the Prefect flow automatically without touching flow logic
+Adding a new table = adding a `FlowConfig` entry to the registry → the factory generates the Prefect flow automatically without touching flow logic.
 
 ---
 
 ### 2. Domain-split registry — 4 files instead of one
 
-FLOW_REGISTRY is split into 4 domain registry files:
+`FLOW_REGISTRY` is split into 4 domain registry files:
 
 ```
 flows/registry/
@@ -97,7 +98,7 @@ flows/registry/
 └── registry_unit.py     ←  2 flows · dim/fact unit
 ```
 
-`flow_registry.py` merges all four into a single `FLOW_REGISTRY: tuple[FlowConfig, ...]`
+`flow_registry.py` merges all four into a single `FLOW_REGISTRY: tuple[FlowConfig, ...]`.
 
 **Why not consolidate into one file:**
 - a single registry would have 33 entries in one file → hard to diff when two people edit simultaneously
@@ -105,10 +106,98 @@ flows/registry/
 
 ---
 
-### 3. SourceConfig.is_join — separates lookup tables from fact sources
+### 3. Extract modes — 3 functions for 3 use cases
 
-Some tables need to join with lookup tables (e.g. gender, branch) that must not be date-filtered
-because all records are required:
+`main_components.py` exposes three extract functions, each designed for a specific read pattern:
+
+```
+fn_Get_Source_Lake()        → incremental
+fn_Gen_Source_Lake_Join()   → full dedup to latest row per key
+fn_Get_Source_Lake_Hist()   → multi-year history scan
+```
+
+**Incremental (`fn_Get_Source_Lake`)** — default mode. Reads a single hive partition
+(`calendar_year=YYYY/month_no=M/day_of_month=D`) matching the job date. If `p_full_data=1`,
+the date predicate is omitted and all partitions are read.
+
+**Full dedup (`fn_Gen_Source_Lake_Join`)** — used for lookup/reference tables (e.g. gender codes,
+branch master) where every record is needed, not just yesterday's. Reads all partitions then
+deduplicates by keeping the most recent row per `groupby` key:
+
+```python
+idx = (
+    df.sort_values(["calendar_year", "month_no", "day_of_month"], ascending=False)
+    .groupby(p_groupby)
+    .head(1)
+    .index
+)
+```
+
+This dedup happens in the extract layer so the transform function always receives a clean,
+non-duplicate DataFrame without handling it itself.
+
+**Multi-year history (`fn_Get_Source_Lake_Hist`)** — iterates year by year from the current year
+back `p_numofyear` steps. Used by `mobileregister` full loads that require the full historical
+register, not just a rolling window.
+
+`SourceConfig.is_join=True` routes a source through `fn_Gen_Source_Lake_Join`; the default
+(`is_join=False`) routes through `fn_Get_Source_Lake`.
+
+---
+
+### 4. Load pattern — temp-table upsert instead of MERGE
+
+BigQuery's `MERGE` statement would be the natural choice for upsert, but it was not used here
+because `CREATE TABLE ... LIKE` copies the partition and clustering spec from the target table
+onto the temp dataset, which BigQuery rejects when the temp dataset has no default partitioning.
+
+**Decision:** a 4-step temp-table pattern that avoids this constraint:
+
+```
+Step 1 — pandas_gbq.to_gbq(..., if_exists="replace")
+         writes DataFrame → temp_table.<temp>
+         pandas_gbq infers schema without partition/cluster spec → no BadRequest
+
+Step 2 — DELETE FROM target WHERE EXISTS (SELECT 1 FROM temp WHERE PK match)
+         removes all rows whose PK exists in the temp table
+
+Step 3 — INSERT INTO target SELECT ... FROM temp
+         with explicit CAST per column (see below)
+
+Step 4 — TRUNCATE TABLE temp
+         clears the temp table for the next run
+```
+
+**Why explicit CAST in the INSERT SELECT:**
+`pandas_gbq.to_gbq` infers `pd.Timestamp` columns as `DATETIME` in the temp table,
+but the target table declares those columns as `TIMESTAMP`. BigQuery rejects a bare
+`SELECT *` across this type mismatch. The fix is `_build_insert_select()`, which reads
+the target table's schema via the BigQuery client API and wraps every column with its
+correct `CAST(col AS <type>)`:
+
+```python
+def _build_insert_select(self, client, p_schema, p_table, temp_table):
+    target_schema = client.get_table(client.dataset(p_schema).table(p_table)).schema
+    cols = []
+    for field in target_schema:
+        fname = f"`{field.name}`"
+        if field.field_type == "TIMESTAMP":
+            cols.append(f"CAST({fname} AS TIMESTAMP) AS {fname}")
+        elif field.field_type == "DATE":
+            cols.append(f"CAST({fname} AS DATE) AS {fname}")
+        elif field.field_type == "INT64":
+            cols.append(f"CAST({fname} AS INT64) AS {fname}")
+        elif field.field_type == "STRING":
+            cols.append(f"CAST({fname} AS STRING) AS {fname}")
+        else:
+            cols.append(fname)
+    select_clause = ", ".join(cols)
+    return f"INSERT INTO `{GCP_PROJECT}.{p_schema}.{p_table}` SELECT {select_clause} FROM `{GCP_PROJECT}.temp_table.{temp_table}`"
+```
+
+---
+
+### 5. SourceConfig.is_join — separates lookup tables from incremental sources
 
 ```python
 # is_join=False (default) — incremental: filter by job_year/month/day
@@ -120,12 +209,9 @@ SourceConfig(tablename="tmMobileGender", source_type="", bucket_app=BUCKET_MSSQL
              is_join=True, groupby=("fcid"))
 ```
 
-`extract_lake_join()` reads all Parquet partitions and deduplicates by keeping the most recent row per key —
-so the transform function receives a clean DataFrame without handling deduplication itself
-
 ---
 
-### 4. dim_party has 4 FlowConfigs for a single target table
+### 6. dim_party has 4 FlowConfigs for a single target table
 
 `dim_party` in BigQuery stores customer party data from 4 different sources; each source
 has a completely different schema and business logic:
@@ -138,15 +224,15 @@ has a completely different schema and business logic:
 | `dim_party_3` | loyalty tmMemberLoyalty | Member status update |
 
 Rather than writing a single transform function to handle all cases, each case has its own `FlowConfig` and
-its own `transform_fn` — keeping logic clearly separated and independently testable
+its own `transform_fn` — keeping logic clearly separated and independently testable.
 
-`flow_factory.py` handles duplicate `dwh_table` names by appending a `_<n>` suffix as the dict key
+`flow_factory.py` handles duplicate `dwh_table` names by appending a `_<n>` suffix as the dict key.
 
 ---
 
-### 5. cron_override per flow — each flow schedules independently
+### 7. cron_override per flow — each flow schedules independently
 
-Each ETL table depends on the ingest schedule of its source repo
+Each ETL table depends on the ingest schedule of its source repo.
 `FlowConfig.cron_override` allows per-flow scheduling without hardcoding schedules in the factory:
 
 ```python
@@ -156,14 +242,14 @@ CRON_04_00_ICT = "0  21 * * *"   # 04:00 ICT
 CRON_05_00_ICT = "0  22 * * *"   # 05:00 ICT — dim_party memberstatus (must run after dim_party RU)
 ```
 
-priority: `FlowConfig.cron_override` → `CRON_SCHEDULE` (default) → `None` (develop)
+Priority: `FlowConfig.cron_override` → `CRON_SCHEDULE` (default) → `None` (develop)
 
 ---
 
 ## Project Structure
 
 ```
-etl-pms-customer/
+etl-customer-profile/
 ├── flows/
 │   ├── flow_config.py          # FlowConfig + SourceConfig dataclasses
 │   ├── flow_factory.py         # make_flow() + ALL_FLOWS dict
@@ -175,8 +261,8 @@ etl-pms-customer/
 │       └── registry_unit.py    #  2 FlowConfigs · unit domain
 │
 ├── tasks/
-│   ├── tasks.py                # Prefect @task: extract_lake, extract_lake_join, extract_dwh, load
-│   ├── main_components.py      # ETL core: GCS reader, BigQuery upsert
+│   ├── tasks.py                # Prefect @task wrappers: extract_lake, extract_lake_join, extract_dwh, load
+│   ├── main_components.py      # ETL core: ExtractSourceData (3 modes), LoadSourceData (temp-table upsert)
 │   └── tasks_pmscustomer_dwh_{table}.py   # per-table transform function (33 files)
 │
 ├── config/
@@ -263,7 +349,7 @@ etl-pms-customer/
 | Variable | Default | Description |
 |---|---|---|
 | `CI_COMMIT_BRANCH` | `develop` | `main` → production config |
-| `IMAGE_TAG` | `etl-pms-customer:local` | Docker image tag |
+| `IMAGE_TAG` | `etl-customer-profile:local` | Docker image tag |
 | `PREFECT_DEPLOY_MODE` | *(unset)* | `1` → skips Secret Manager during deploy |
 | `PREFECT_WORK_POOL` | `kubernetes-pool` | Prefect work pool |
 | `JOB_YEAR` / `JOB_MONTH` / `JOB_DAY` | `None` | Run date (None = yesterday ICT) |
@@ -283,26 +369,26 @@ etl-pms-customer/
 ```python
 @dataclass(frozen=True)
 class FlowConfig:
-    dwh_table:        str                   # BQ target table name
-    pk:               tuple[str, ...]       # PK columns for upsert MERGE
+    dwh_table:        str                       # BQ target table name
+    pk:               tuple[str, ...]           # PK columns for upsert
     sources:          tuple[SourceConfig, ...]  # ordered list of sources
-    transform_fn:     Callable              # transform function (@task)
-    schema:           str = "los"           # BQ dataset/schema
-    default_full_data: str = "0"            # "0"=incremental, "1"=full
-    p_insert:         int = 0              # 0=upsert, 1=append
-    cron_override:    str | None = None    # per-flow cron override
-    origin:           str = ""             # reference to the original v1 repo
+    transform_fn:     Callable                  # transform function (@task)
+    schema:           str = "los"               # BQ dataset/schema
+    default_full_data: str = "0"                # "0"=incremental, "1"=full
+    p_insert:         int = 0                   # 0=upsert (temp-table), 1=append
+    cron_override:    str | None = None         # per-flow cron override
+    origin:           str = ""                  # reference to the original v1 repo
 
 @dataclass(frozen=True)
 class SourceConfig:
-    tablename:   str                        # GCS table name
-    source_type: str                        # sub-folder: 'postgresql' or '' (MSSQL)
-    bucket_app:  str                        # GCS application prefix
-    columns:     tuple[str, ...] | None = None   # None = all columns
-    groupby:     tuple[str, ...] | None = None   # dedup key for is_join
-    is_join:     bool = False               # True → extract_lake_join
-    is_dwh:      bool = False               # True → extract_dwh (BQ query)
-    query:       str = ""                   # SQL for is_dwh=True sources
+    tablename:   str                            # GCS table name
+    source_type: str                            # sub-folder: 'postgresql' or '' (MSSQL)
+    bucket_app:  str                            # GCS application prefix
+    columns:     tuple[str, ...] | None = None  # None = all columns
+    groupby:     tuple[str, ...] | None = None  # dedup key for is_join
+    is_join:     bool = False                   # True → extract_lake_join (full dedup)
+    is_dwh:      bool = False                   # True → extract_dwh (BQ query)
+    query:       str = ""                       # SQL for is_dwh=True sources
 ```
 
 ---
