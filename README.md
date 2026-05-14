@@ -1,374 +1,335 @@
 # etl-pms-customer
 
-ETL pipeline for **PMS Customer domain** → BigQuery DWH (`los` schema)
+ETL pipeline — **GCS Data Lake → BigQuery DWH · PMS Customer domain**
 
-Merged from 6 legacy Prefect v1 repos:
+Reads Parquet from GCS Data Lake (output of ingest repos), transforms, and upserts into BigQuery
+Covers Customer, Party, User, Company, Project, and Unit for the PMS (Property Management System)
 
-| Legacy repo | Flows | Registry domain |
+**Stack:** Python · pandas · BigQuery Client · gcsfs · GCP Secret Manager · Prefect v3 · Docker · Jenkins
+
+---
+
+## TL;DR
+
+| | |
+|---|---|
+| **Source** | GCS Data Lake — Parquet from 8+ ingest repos (`pmsmanagement`, `gcp-ingest-mssql`, `authentication`, `pdpa`, `homeservice`, `notification`, `mobileregister`, `loyalty`) |
+| **Sink** | BigQuery schema `los` — 33 flows → dim/fact tables |
+| **Pattern** | Factory + Registry — `FlowConfig` dataclass is the single source of truth; `make_flow()` generates Prefect flows from config |
+| **Load mode** | Upsert by PK (default) or append — configured per table in `FlowConfig` |
+| **Auth** | GCP Secret Manager (ADC on worker) — no credentials hardcoded in the repo |
+
+---
+
+## Architecture Overview
+
+```
+GCS Data Lake
+  gs://{bucket}/gcp-storage-parquet/{application}/{source_type}/{table}/
+      calendar_year=YYYY/month_no=M/day_of_month=D/
+  │
+  │  gcsfs + pandas · read_parquet()
+  ▼
+[Extract Task]
+  extract_lake()      — reads Parquet for the specified date (incremental)
+  extract_lake_join() — reads all partitions + deduplicates to latest row (lookup tables)
+  extract_dwh()       — queries BigQuery directly (pulls existing data for use in transform)
+  │
+  ▼
+[Transform Task]
+  transform_fn() per table — table-specific business logic
+  output: pd.DataFrame ready for upsert
+  │
+  ▼
+[Load Task]
+  load() — upsert into BigQuery (MERGE by PK) or append
+  target: your-gcp-project-id.los.{dwh_table}
+```
+
+**Credentials flow:**
+- Worker Node uses **ADC (Workload Identity)** to call GCP Secret Manager
+- Secret Manager returns SA key JSON → separate credentials are constructed for GCS (Storage) and BigQuery
+- `PREFECT_DEPLOY_MODE=1` → skips Secret Manager during the deploy step
+
+---
+
+## Design Decisions
+
+### 1. FlowConfig + flow_factory — why not write flow functions directly
+
+The previous repo (Prefect v1) wrote a separate flow function per table — that pattern caused:
+- repeated boilerplate: extract → transform → load duplicated in every flow
+- adding a new table required creating a full new file and editing the deploy script
+
+**Decision:** separate _config_ from _execution_ using a dataclass + factory
+
+```python
+# FlowConfig — describes what the flow does
+FlowConfig(
+    dwh_table    = "fact_authuser",
+    pk           = ("date_id", "auth_id"),
+    sources      = (
+        SourceConfig(tablename="users", source_type="postgresql",
+                     bucket_app=BUCKET_AUTHENTICATION),
+    ),
+    transform_fn = transform_fact_authuser,
+    cron_override = CRON_01_40_ICT,
+)
+
+# make_flow() — automatically generates a @flow from config
+# loop: extract sources → transform → load → upsert BQ
+```
+
+Adding a new table = adding a `FlowConfig` entry to the registry → the factory generates the Prefect flow automatically without touching flow logic
+
+---
+
+### 2. Domain-split registry — 4 files instead of one
+
+FLOW_REGISTRY is split into 4 domain registry files:
+
+```
+flows/registry/
+├── registry_user.py     ← 13 flows · dim/fact tables sourced from authentication, homeservice,
+│                          iprop/MSSQL, mobileregister, pdpa, pmsmanagement
+├── registry_company.py  ←  3 flows · dim/fact tables for PMS company
+├── registry_project.py  ← 10 flows · dim/fact tables for project, address, postcode
+└── registry_unit.py     ←  2 flows · dim/fact unit
+```
+
+`flow_registry.py` merges all four into a single `FLOW_REGISTRY: tuple[FlowConfig, ...]`
+
+**Why not consolidate into one file:**
+- a single registry would have 33 entries in one file → hard to diff when two people edit simultaneously
+- the domain boundary aligns with feature ownership: editing the user domain doesn't require opening the project registry
+
+---
+
+### 3. SourceConfig.is_join — separates lookup tables from fact sources
+
+Some tables need to join with lookup tables (e.g. gender, branch) that must not be date-filtered
+because all records are required:
+
+```python
+# is_join=False (default) — incremental: filter by job_year/month/day
+SourceConfig(tablename="tmCOR", source_type="", bucket_app=BUCKET_MSSQL)
+
+# is_join=True — full dedup: reads all partitions + keeps the latest row per groupby key
+SourceConfig(tablename="tmMobileGender", source_type="", bucket_app=BUCKET_MSSQL,
+             columns=("fcid","fcnameen",...),
+             is_join=True, groupby=("fcid"))
+```
+
+`extract_lake_join()` reads all Parquet partitions and deduplicates by keeping the most recent row per key —
+so the transform function receives a clean DataFrame without handling deduplication itself
+
+---
+
+### 4. dim_party has 4 FlowConfigs for a single target table
+
+`dim_party` in BigQuery stores customer party data from 4 different sources; each source
+has a completely different schema and business logic:
+
+| FlowConfig key | Source | Party type |
 |---|---|---|
-| `etl-authentication` | 1 | user |
-| `etl-homeservice` | 1 | user |
-| `etl-iprop` | 15 | user, project, unit |
-| `etl-mobileregister` | 3 | user |
-| `etl-pdpa` | 1 | user |
-| `etl-pmsmanagement` | 12 | user, company, project |
+| `dim_party` | homeservice seekster_provider | Provider (GU/homeservice) |
+| `dim_party_1` | MSSQL tmmobileuser + mobileregister customer | GU (eco app user) |
+| `dim_party_2` | MSSQL tmCOR | RU (real estate buyer) |
+| `dim_party_3` | loyalty tmMemberLoyalty | Member status update |
 
-**Runtime:** Prefect v3 · Kubernetes worker pool · SA key via GCP Secret Manager
+Rather than writing a single transform function to handle all cases, each case has its own `FlowConfig` and
+its own `transform_fn` — keeping logic clearly separated and independently testable
 
----
-
-## Table of Contents
-
-1. [Repository Structure](#1-repository-structure)
-2. [Flows & Tables](#2-flows--tables)
-3. [Architecture](#3-architecture)
-4. [Authentication](#4-authentication)
-5. [Configuration](#5-configuration)
-6. [Local Development](#6-local-development)
-7. [Repair & Backfill](#7-repair--backfill)
-8. [Deployment](#8-deployment)
-9. [Adding a New Flow](#9-adding-a-new-flow)
-10. [Manifest & Overview](#10-manifest--overview)
-11. [Key Changes from v1](#11-key-changes-from-v1)
+`flow_factory.py` handles duplicate `dwh_table` names by appending a `_<n>` suffix as the dict key
 
 ---
 
-## 1. Repository Structure
+### 5. cron_override per flow — each flow schedules independently
+
+Each ETL table depends on the ingest schedule of its source repo
+`FlowConfig.cron_override` allows per-flow scheduling without hardcoding schedules in the factory:
+
+```python
+CRON_01_40_ICT = "40 18 * * *"   # 01:40 ICT — must run after ingest_gcp_mssql_popcorn
+CRON_03_40_ICT = "40 20 * * *"   # 03:40 ICT — must run after ingest_gcp_postgresql_ecoapp
+CRON_04_00_ICT = "0  21 * * *"   # 04:00 ICT
+CRON_05_00_ICT = "0  22 * * *"   # 05:00 ICT — dim_party memberstatus (must run after dim_party RU)
+```
+
+priority: `FlowConfig.cron_override` → `CRON_SCHEDULE` (default) → `None` (develop)
+
+---
+
+## Project Structure
 
 ```
 etl-pms-customer/
-├── config/
-│   ├── __init__.py              # env-based import + SA key from Secret Manager
-│   ├── development.py           # nonprd bucket, secret name
-│   └── production.py            # prd bucket, secret name
-│
-├── config_flows/
-│   └── __init__.py              # APPLICATION_TYPE, JOB_* env vars, CRON_SCHEDULE constants
-│
 ├── flows/
-│   ├── __init__.py
-│   ├── flow_registry.py         # FlowConfig / SourceConfig dataclasses + FLOW_REGISTRY
-│   ├── flow_factory.py          # make_flow(cfg) engine + ALL_FLOWS dict
+│   ├── flow_config.py          # FlowConfig + SourceConfig dataclasses
+│   ├── flow_factory.py         # make_flow() + ALL_FLOWS dict
+│   ├── flow_registry.py        # merges 4 domain registries → FLOW_REGISTRY
 │   └── registry/
-│       ├── __init__.py
-│       ├── registry_user.py     # 13 flows — user domain
-│       ├── registry_company.py  #  3 flows — company domain
-│       ├── registry_project.py  # 13 flows — project domain
-│       └── registry_unit.py     #  2 flows — unit domain
+│       ├── registry_user.py    # 13 FlowConfigs · user domain
+│       ├── registry_company.py #  3 FlowConfigs · company domain
+│       ├── registry_project.py # 10 FlowConfigs · project domain
+│       └── registry_unit.py    #  2 FlowConfigs · unit domain
 │
 ├── tasks/
-│   ├── main_components.py       # ConnectorDB, ExtractSourceData, LoadSourceData, CommonSQL
-│   ├── tasks.py                 # Generic @task: extract_lake, extract_lake_join, extract_dwh, load
-│   └── tasks_pmscustomer_dwh_*.py   # Per-table Transform @task (31 files)
+│   ├── tasks.py                # Prefect @task: extract_lake, extract_lake_join, extract_dwh, load
+│   ├── main_components.py      # ETL core: GCS reader, BigQuery upsert
+│   └── tasks_pmscustomer_dwh_{table}.py   # per-table transform function (33 files)
+│
+├── config/
+│   ├── __init__.py             # env dispatcher + Secret Manager + PREFECT_DEPLOY_MODE guard
+│   ├── production.py           # production constants
+│   └── development.py          # development constants
+│
+├── config_flows/
+│   └── __init__.py             # APPLICATION_TYPE, cron constants, job date params
 │
 ├── scripts/
-│   ├── build.sh                 # Docker build + push → Artifact Registry
-│   ├── register.sh              # run deploy.py inside container
-│   └── generate_manifest.py     # Generate manifest.yaml from FLOW_REGISTRY
+│   ├── build.sh                # Build Docker image
+│   ├── register.sh             # Register Prefect deployments
+│   └── generate_manifest.py    # Generate deployment manifest
 │
-├── deploy.py                    # Register flows via flow.deploy() Python API
-├── run_local.py                 # Local repair runner (pre-platform / backfill)
-├── prefect.yaml                 # Prefect v3 project metadata
+├── deploy.py                   # Registers all flows as Prefect deployments
+├── run_local.py                # CLI: run a single flow or all flows locally
 ├── Dockerfile
-├── Jenkinsfile
-├── requirements.txt
-├── .env.example
-└── .gitignore
+└── requirements.txt
 ```
 
 ---
 
-## 2. Flows & Tables
+## Registered Flows (33 flows)
 
-### Domain: user (13 flows)
+### Domain: user — `registry_user.py`
 
-| Flow (dwh_table) | BQ Target | Origin repo | PK |
+| BQ Table | PK | Sources | Schedule |
 |---|---|---|---|
-| `fact_authuser` | `los.fact_authuser` | etl-authentication | `date_id, auth_id` |
-| `dim_party` (homeservice) | `los.dim_party` | etl-homeservice | `date_id, party_id, party_type_id` |
-| `dim_party` (GU/ecoapp) | `los.dim_party` | etl-iprop | `date_id, party_id, party_type_id` |
-| `dim_party` (RU/MSSQL) | `los.dim_party` | etl-iprop | `date_id, party_id, party_type_id` |
-| `dim_party` (memberstatus) | `los.dim_party` | etl-iprop | `date_id, party_id, party_type_id` |
-| `dim_userpermission` | `los.dim_userpermission` | etl-iprop | `date_id, project_id, branch_id, usergroup_id, user_id, mnu_id` |
-| `fact_user` | `los.fact_user` | etl-iprop | `date_id, user_id, usergroup_id` |
-| `fact_userpermission` | `los.fact_userpermission` | etl-iprop | `date_id, project_id, branch_id, usergroup_id, mnu_id` |
-| `dim_device_detail` | `los.dim_device_detail` | etl-mobileregister | `date_id, device_id` |
-| `dim_mobile_user` | `los.dim_mobile_user` | etl-mobileregister | `date_id, customer_id, unit_id` |
-| `fact_unitresident` | `los.fact_unitresident` | etl-mobileregister | `date_id, corhist_id` |
-| `fact_userconsent` | `los.fact_userconsent` | etl-pdpa | `date_id, uconsent_id` |
-| `dim_pmsuserprofile` | `los.dim_pmsuserprofile` | etl-pmsmanagement | `date_id, user_id` |
-| `fact_pmsinvitations` | `los.fact_pmsinvitations` | etl-pmsmanagement | `date_id, invite_id` |
-| `fact_pmsuser_role` | `los.fact_pmsuser_role` | etl-pmsmanagement | `date_id, record_id` |
+| `fact_authuser` | date_id, auth_id | authentication/users | 01:40 |
+| `dim_party` | date_id, party_id, party_type_id | homeservice/seekster_provider | 03:40 |
+| `dim_party_1` | date_id, party_id, party_type_id | MSSQL/tmmobileuser + mobileregister/customer | 03:40 |
+| `dim_party_2` | date_id, party_id, party_type_id | MSSQL/tmCOR + tmMobileGender + tmRoomH | 04:00 |
+| `dim_party_3` | date_id, party_id, party_type_id | loyalty/tmMemberLoyalty | 05:00 |
+| `dim_userpermission` | date_id, project_id, branch_id, usergroup_id, user_id, mnu_id | MSSQL/tmAUT | 04:40 |
+| `fact_user` | date_id, user_id, usergroup_id | MSSQL/tmUSR | 04:40 |
+| `fact_userpermission` | date_id, project_id, branch_id, usergroup_id, mnu_id | MSSQL/tmAUT | 04:40 |
+| `dim_device_detail` | date_id, device_id | notification/gu_device | 01:40 |
+| `dim_mobile_user` | date_id, customer_id, unit_id | mobileregister/customer | 01:40 |
+| `fact_unitresident` | date_id, corhist_id | MSSQL/ttCORHist | 01:40 |
+| `fact_userconsent` | date_id, uconsent_id | pdpa/users_consent + consents + consent_versions | 03:40 |
+| `dim_pmsuserprofile` | date_id, user_id | pmsmanagement/users + profiles | 03:40 |
+| `fact_pmsinvitations` | date_id, invite_id | pmsmanagement/invitations | 03:40 |
+| `fact_pmsuser_role` | date_id, record_id | pmsmanagement/user_roles | 03:40 |
 
-### Domain: company (3 flows)
+### Domain: company — `registry_company.py`
 
-| Flow (dwh_table) | BQ Target | Origin repo | PK |
+| BQ Table | PK | Sources | Schedule |
 |---|---|---|---|
-| `dim_pmscompany` | `los.dim_pmscompany` | etl-pmsmanagement | `date_id, company_id` |
-| `fact_pmsinvitation_company` | `los.fact_pmsinvitation_company` | etl-pmsmanagement | `date_id, record_id` |
-| `fact_pmsinvitationhist_company` | `los.fact_pmsinvitationhist_company` | etl-pmsmanagement | `date_id, record_id` |
+| `dim_pmscompany` | date_id, company_id | pmsmanagement/companies | 03:40 |
+| `fact_pmsinvitation_company` | date_id, record_id | pmsmanagement/invitation_companies + invitations | 03:40 |
+| `fact_pmsinvitationhist_company` | date_id, record_id | pmsmanagement/company_audit_logs | 03:40 |
 
-### Domain: project (13 flows)
+### Domain: project — `registry_project.py`
 
-| Flow (dwh_table) | BQ Target | Origin repo | PK |
+| BQ Table | PK | Sources | Schedule |
 |---|---|---|---|
-| `dim_address` (tmCOR) | `los.dim_address` | etl-iprop | `date_id` |
-| `dim_address` (mobileuser) | `los.dim_address` | etl-iprop | `date_id` |
-| `dim_address_type` | `los.dim_address_type` | etl-iprop | `date_id, addr_type_id` |
-| `dim_postcode` | `los.dim_postcode` | etl-iprop | `date_id, postcode_id` |
-| `dim_project` | `los.dim_project` | etl-iprop | `date_id, project_id, project_profile_id` |
-| `dim_project_profile` | `los.dim_project_profile` | etl-iprop | `date_id, project_profile_id` |
-| `dim_project_bookbank` | `los.dim_project_bookbank` | etl-iprop | `date_id, bookbank_id` |
-| `dim_pmsproject` | `los.dim_pmsproject` | etl-pmsmanagement | `date_id, project_id` |
-| `dim_pmsrole_permission` | `los.dim_pmsrole_permission` | etl-pmsmanagement | `date_id, record_id` |
-| `fact_pmscompany_projects` | `los.fact_pmscompany_projects` | etl-pmsmanagement | `date_id, mapping_log_id` |
-| `fact_pmsinvitation_project` | `los.fact_pmsinvitation_project` | etl-pmsmanagement | `date_id, record_id` |
-| `fact_pmsinvitationhist_project` | `los.fact_pmsinvitationhist_project` | etl-pmsmanagement | `date_id, record_id` |
-| `fact_pmsproject_features` | `los.fact_pmsproject_features` | etl-pmsmanagement | `date_id, project_id, feature_id` |
+| `dim_address` | date_id, addr_id | MSSQL/tmADR (×2 sub-flows) | — |
+| `dim_address_type` | date_id, addr_type_id | MSSQL/tmADT | — |
+| `dim_postcode` | date_id, postcode_id | MSSQL/tmPCODE | — |
+| `dim_project` | date_id, project_id, project_profile_id | MSSQL/tmBRN + tmCOM + tmPRJ | — |
+| `dim_project_profile` | date_id, project_profile_id | MSSQL/tmPRJ | — |
+| `dim_project_bookbank` | date_id, bookbank_id | MSSQL/tmBKB | — |
+| `dim_pmsproject` | date_id, project_id | pmsmanagement/companies_projects | 03:40 |
+| `dim_pmsrole_permission` | date_id, record_id | pmsmanagement/features + feature_groups | 03:40 |
+| `fact_pmscompany_projects` | date_id, mapping_log_id | pmsmanagement/companies_projects_logs | 03:40 |
+| `fact_pmsinvitation_project` | date_id, record_id | pmsmanagement/invitation_projects | 03:40 |
+| `fact_pmsinvitationhist_project` | date_id, record_id | pmsmanagement/invitation_projects + audit | 03:40 |
+| `fact_pmsproject_features` | date_id, project_id, feature_id | pmsmanagement/companies_projects + features | 03:40 |
 
-### Domain: unit (2 flows)
+### Domain: unit — `registry_unit.py`
 
-| Flow (dwh_table) | BQ Target | Origin repo | PK |
+| BQ Table | PK | Sources | Schedule |
 |---|---|---|---|
-| `dim_unit` | `los.dim_unit` | etl-iprop | `date_id, unit_id` |
-| `fact_unit` | `los.fact_unit` | etl-iprop | `date_id, unit_id` |
-
-**Total: 33 flows**
+| `dim_unit` | date_id, unit_id | MSSQL/tmRoomH + tmBRN + ... | — |
+| `fact_unit` | date_id, unit_id | MSSQL/tmRoomH | — |
 
 ---
 
-## 3. Architecture
+## Configuration
 
-### Data Flow
+### Environment Variables
 
-```
-GCS Data Lake (Parquet/Hive)
-        │
-        │  extract_lake / extract_lake_join @task
-        │  (1 call per SourceConfig)
-        ▼
-  pd.DataFrame
-        │
-        │  transform_<table> @task
-        │  (business logic — 1 file per BQ table)
-        ▼
-  pd.DataFrame (cleaned)
-        │
-        │  load @task
-        │  (upsert via temp table or append)
-        ▼
-BigQuery DWH — los.<table>
-```
-
-### Registry Pattern
-
-```
-FLOW_REGISTRY  (flow_registry.py)
-      ├── FLOWS from registry_user.py     (15 FlowConfig rows)
-      ├── FLOWS from registry_company.py  ( 3 FlowConfig rows)
-      ├── FLOWS from registry_project.py  (13 FlowConfig rows)
-      └── FLOWS from registry_unit.py     ( 2 FlowConfig rows)
-               │
-               ▼
-      flow_factory.py → make_flow(cfg)
-               │
-               ▼
-      ALL_FLOWS dict  {dwh_table: @flow_fn}
-               │
-     ┌─────────┴─────────┐
-     ▼                   ▼
-deploy.py           run_local.py
-(register flows)    (repair/backfill)
-```
-
----
-
-## 4. Authentication
-
-| Resource | Method |
-|---|---|
-| GCS (read Parquet) | SA key JSON → `service_account.Credentials` (STORAGE_SCOPES) |
-| BigQuery (write DWH) | SA key JSON → `service_account.Credentials` (BIGQUERY_SCOPES) |
-| `pandas_gbq.to_gbq()` | SA key JSON credentials on every call |
-| SA key source | **GCP Secret Manager** — secret: `gcp-dwh-service-account` |
-| Secret Manager access | **ADC / Workload Identity** on worker node — no key file in container |
-
-SA key fetched via `config._load_sa_key_json()` with `@lru_cache(maxsize=1)` — fetched once per process.
-
-```bash
-# Local dev: authenticate with ADC
-gcloud auth application-default login
-```
-
----
-
-## 5. Configuration
-
-### `config_flows/__init__.py` — Schedule constants
-
-```python
-CRON_SCHEDULE   = "40 20 * * *"   # 03:40 ICT — repo default
-CRON_01_40_ICT  = "40 18 * * *"   # 01:40 ICT
-CRON_03_40_ICT  = "40 20 * * *"   # 03:40 ICT
-CRON_04_00_ICT  = "0  21 * * *"   # 04:00 ICT
-CRON_04_40_ICT  = "40 21 * * *"   # 04:40 ICT
-CRON_05_00_ICT  = "0  22 * * *"   # 05:00 ICT
-```
-
-**Schedule priority in `deploy.py`:**
-```
-FlowConfig.cron_override   ← per-flow override
-        ↓ fallback
-CRON_SCHEDULE              ← repo-level default
-        ↓ develop branch
-None (paused)              ← always paused on develop
-```
-
----
-
-## 6. Local Development
-
-```bash
-# 1. Create virtualenv
-python -m venv .venv && source .venv/bin/activate
-
-# 2. Install dependencies
-pip install -r requirements.txt
-
-# 3. Configure env
-cp .env.example .env  # edit as needed
-export $(cat .env | xargs)
-
-# 4. GCP auth (ADC)
-gcloud auth application-default login
-
-# 5. List all flows
-python -c "from flows.flow_factory import ALL_FLOWS; print(list(ALL_FLOWS))"
-
-# 6. Generate manifest
-python scripts/generate_manifest.py
-```
-
----
-
-## 7. Repair & Backfill
-
-```bash
-# Single date
-python run_local.py --flow dim_pmscompany --start 2025-06-15
-
-# Date range
-python run_local.py --flow fact_authuser --start 2025-06-01 --end 2025-06-30
-
-# Full scan
-python run_local.py --flow dim_pmscompany --full
-
-# All flows (yesterday)
-python run_local.py --flow all
-
-# dim_party sub-flows (suffix _n for duplicates)
-python run_local.py --flow dim_party_0   # homeservice sub-flow
-python run_local.py --flow dim_party_1   # GU/ecoapp
-python run_local.py --flow dim_party_2   # RU/MSSQL
-python run_local.py --flow dim_party_3   # memberstatus update
-```
-
----
-
-## 8. Deployment
-
-### CI/CD Flow (Jenkins)
-
-```
-git push → Jenkins trigger
-    ├── Build Docker image
-    ├── Push → Google Artifact Registry
-    └── Register flows → Prefect Server (python deploy.py)
-```
-
-### Manual Deploy
-
-```bash
-export CI_COMMIT_BRANCH=main
-export IMAGE_TAG=asia-southeast1-docker.pkg.dev/your-gcp-project-id/docker-registry/etl-pms-customer:main-abc123
-export PREFECT_API_URL=http://<PREFECT_SERVER_IP>:4200/api
-
-bash scripts/build.sh
-bash scripts/register.sh
-```
-
----
-
-## 9. Adding a New Flow
-
-### Step 1 — Create transform task
-
-```python
-# tasks/tasks_pmscustomer_dwh_<table>.py
-
-from prefect import get_run_logger, task
-import pandas as pd
-
-@task(name="transform_<table>")
-def transform_<table>(p_data: list[pd.DataFrame]) -> pd.DataFrame:
-    logger = get_run_logger()
-    df_final = p_data[0].copy()
-    # ... business logic ...
-    return df_final
-```
-
-### Step 2 — Add FlowConfig to the appropriate registry
-
-```python
-# flows/registry/registry_<domain>.py
-
-from tasks.tasks_pmscustomer_dwh_<table> import transform_<table>
-
-FLOWS: tuple[FlowConfig, ...] = (
-    *existing_flows,
-    FlowConfig(
-        dwh_table    = "<table>",
-        pk           = ("date_id", "<pk_col>"),
-        sources      = (
-            SourceConfig(tablename="<gcs_table>", source_type="postgresql",
-                         bucket_app=BUCKET_PMSMANAGEMENT),
-        ),
-        transform_fn = transform_<table>,
-        origin       = "etl-pmsmanagement@prefect-v1",
-    ),
-)
-```
-
-> **No changes needed** to `deploy.py`, `run_local.py`, `flow_registry.py`, or `flow_factory.py` — everything updates automatically through `FLOW_REGISTRY`.
-
----
-
-## 10. Manifest & Overview
-
-```bash
-# Generate stdout manifest (develop env)
-python scripts/generate_manifest.py
-
-# Write YAML for main env
-python scripts/generate_manifest.py --env main --out manifest.yaml
-
-# JSON for Google Sheet sync
-python scripts/generate_manifest.py --env main --format json --out manifest.json
-```
-
----
-
-## 11. Key Changes from v1
-
-| Area | v1 (Prefect v1) | v3 (Prefect v3 — this repo) |
+| Variable | Default | Description |
 |---|---|---|
-| Flow declaration | `with Flow(...) as flow:` | `@flow` via `make_flow()` factory |
-| Task declaration | `class T(Task): def run(self,...)` | `@task` function |
-| Logger | `prefect.context.get("logger")` | `get_run_logger()` |
-| Run config | `KubernetesRun(...)` | `flow.deploy(work_pool_name=...)` |
-| Schedule | `CronClock` in `config_flows/__init__.py` | `cron=` param in `deploy.py` |
-| Auth | SA key file path from env var | SA key JSON from **Secret Manager** via ADC |
-| `GCSFS` | `GCSFileSystem(token=file_path)` | `GCSFileSystem(token=credentials_object)` |
-| Flow structure | 6 separate repos, boilerplate duplication | 1 repo, registry pattern |
-| Scheduler repo | Separate repo | Not needed — schedule in `config_flows` + `deploy.py` |
-| Overview | Not available | `scripts/generate_manifest.py` |
+| `CI_COMMIT_BRANCH` | `develop` | `main` → production config |
+| `IMAGE_TAG` | `etl-pms-customer:local` | Docker image tag |
+| `PREFECT_DEPLOY_MODE` | *(unset)* | `1` → skips Secret Manager during deploy |
+| `PREFECT_WORK_POOL` | `kubernetes-pool` | Prefect work pool |
+| `JOB_YEAR` / `JOB_MONTH` / `JOB_DAY` | `None` | Run date (None = yesterday ICT) |
+| `JOB_FULL_DATA` | `0` | `1` = full scan, `0` = incremental |
+| `JOB_NUMOFYER` | `10` | years of history for mobileregister full load |
+
+### GCP Secret Manager Keys
+
+| Secret key | Used for |
+|---|---|
+| `your-secret-sa-key` | GCS + BigQuery credentials (service account JSON) |
+
+---
+
+## FlowConfig Reference
+
+```python
+@dataclass(frozen=True)
+class FlowConfig:
+    dwh_table:        str                   # BQ target table name
+    pk:               tuple[str, ...]       # PK columns for upsert MERGE
+    sources:          tuple[SourceConfig, ...]  # ordered list of sources
+    transform_fn:     Callable              # transform function (@task)
+    schema:           str = "los"           # BQ dataset/schema
+    default_full_data: str = "0"            # "0"=incremental, "1"=full
+    p_insert:         int = 0              # 0=upsert, 1=append
+    cron_override:    str | None = None    # per-flow cron override
+    origin:           str = ""             # reference to the original v1 repo
+
+@dataclass(frozen=True)
+class SourceConfig:
+    tablename:   str                        # GCS table name
+    source_type: str                        # sub-folder: 'postgresql' or '' (MSSQL)
+    bucket_app:  str                        # GCS application prefix
+    columns:     tuple[str, ...] | None = None   # None = all columns
+    groupby:     tuple[str, ...] | None = None   # dedup key for is_join
+    is_join:     bool = False               # True → extract_lake_join
+    is_dwh:      bool = False               # True → extract_dwh (BQ query)
+    query:       str = ""                   # SQL for is_dwh=True sources
+```
+
+---
+
+## Local Development
+
+```bash
+pip install -r requirements.txt
+cp .env.example .env   # fill in your environment values
+
+export CI_COMMIT_BRANCH=develop
+
+# run a single flow
+python run_local.py --flow fact_authuser
+
+# full data scan
+python run_local.py --flow dim_pmscompany --full_data 1
+
+# specific date
+python run_local.py --flow fact_userconsent --year 2024 --month 3 --day 15
+```
+
+---
+
+## Adding a New Flow
+
+1. Create a transform function in `tasks/tasks_pmscustomer_dwh_{table}.py`
+2. Add a `FlowConfig` entry to the appropriate domain registry (`registry_user.py`, `registry_project.py`, etc.)
+3. Import the transform function at the top of the registry file
+4. `flow_factory.py` generates the Prefect flow automatically — no changes to `deploy.py` or `prefect.yaml` needed
